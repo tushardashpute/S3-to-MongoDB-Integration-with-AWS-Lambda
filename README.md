@@ -4,13 +4,16 @@ This project demonstrates an AWS Lambda function that integrates Amazon S3 and M
 
 - **Insert or Update:** On detecting an `ObjectCreated` event in S3, the Lambda function inserts or updates file metadata in MongoDB.
 - **Delete:** On detecting an `ObjectRemoved` event in S3, the Lambda function removes the corresponding metadata from MongoDB.
+- **Download Support:** Provides an API Gateway integration to download S3 files via a Base64-encoded response.
 
+---
 
 ## Architecture Overview
 
 1. **Amazon S3**: Acts as the storage service for file uploads.
 2. **AWS Lambda**: Processes S3 events and API Gateway requests.
 3. **MongoDB**: Stores metadata for files (e.g., `bucket`, `file_path`, `etag`, `timestamp`).
+4. **API Gateway**: Facilitates downloading files from S3 via HTTP requests.
 
 ---
 
@@ -44,146 +47,42 @@ mongodb://admin:admin123@localhost:27017
 
 ---
 
+## Creating a Lambda Layer
+
+### **Steps to Create the Lambda Layer**
+
+1. Create a directory for the layer:
+   ```bash
+   mkdir -p lambda-layer/python
+   ```
+
+2. Install dependencies (`pymongo` and `requests`) into the directory:
+   ```bash
+   pip3 install pymongo requests -t lambda-layer/python/
+   ```
+
+3. Package the layer into a ZIP file:
+   ```bash
+   cd lambda-layer
+   zip -r pymongo-requests-layer.zip python/
+   ```
+
+4. Publish the layer to AWS Lambda:
+   ```bash
+   aws lambda publish-layer-version \
+     --layer-name pymongo-requests-layer \
+     --zip-file fileb://pymongo-requests-layer.zip \
+     --compatible-runtimes python3.9
+   ```
+
+5. Note the ARN of the published layer and attach it to your Lambda function.
+
+---
+
 ## Lambda Function Implementation
 
-### **Python Script**
-Below is the main Python script for the Lambda function:
-
-```python
-import json
-import boto3
-import base64
-import pymongo
-from pymongo import ReturnDocument
-
-# MongoDB credentials and URI
-MONGO_URI = "mongodb://admin:admin123@host_ip:27017"  # Update with actual MongoDB URI
-DB_NAME = "file_metadata_db"
-COLLECTION_NAME = "files"
-
-# Initialize S3 client
-s3_client = boto3.client('s3')
-
-# MongoDB connection pool
-mongo_client = pymongo.MongoClient(MONGO_URI)
-db = mongo_client[DB_NAME]
-collection = db[COLLECTION_NAME]
-
-def lambda_handler(event, context):
-    """
-    AWS Lambda function to handle:
-    - File download via API Gateway
-    - File upload, modify, and delete triggered by S3 events
-    - Idempotency logic with MongoDB to avoid re-processing the same file
-    """
-    try:
-        # Check if the event is from API Gateway (for download)
-        if 'queryStringParameters' in event:
-            query_params = event['queryStringParameters']
-            bucket_name = query_params.get('bucket', None)
-            file_path = query_params.get('file', None)  # Includes full path if provided
-
-            if not bucket_name or not file_path:
-                return {
-                    "statusCode": 400,
-                    "body": json.dumps("Missing 'bucket' or 'file' query parameter.")
-                }
-
-            # Fetch the file from S3
-            s3_response = s3_client.get_object(Bucket=bucket_name, Key=file_path)
-            file_content = s3_response['Body'].read()
-
-            # Extract the file name
-            file_name = file_path.split('/')[-1]
-
-            # Return the file content as Base64-encoded
-            encoded_content = base64.b64encode(file_content).decode('utf-8')
-            return {
-                "statusCode": 200,
-                "headers": {
-                    "Content-Type": s3_response['ContentType'],
-                    "Content-Disposition": f"attachment; filename={file_name}"
-                },
-                "body": encoded_content,
-                "isBase64Encoded": True
-            }
-
-        # Handle S3 events (upload, modify, delete)
-        elif 'Records' in event:
-            for record in event['Records']:
-                # Extract event details from S3 event
-                s3_event = record['eventName']
-                bucket_name = record['s3']['bucket']['name']
-                file_path = record['s3']['object']['key']
-                
-                # Fetch file metadata from S3
-                s3_response = s3_client.head_object(Bucket=bucket_name, Key=file_path)
-                event_etag = s3_response['ETag'].strip('"')  # Remove quotes around ETag
-                
-                # Step 1: Find the file in MongoDB based on bucket name and file path
-                file_record = collection.find_one({
-                    "bucket": bucket_name,
-                    "file_path": file_path
-                })
-
-                # Step 2: Handle new or modified files based on DB record
-                if file_record is None:
-                    # File doesn't exist in DB, so it's a new file
-                    print(f"New file detected: {file_path}")
-
-                    # Insert the new file record with its ETag into the database
-                    collection.insert_one({
-                        "bucket": bucket_name,
-                        "file_path": file_path,
-                        "etag": event_etag,
-                        "timestamp": record['eventTime']
-                    })
-
-                else:
-                    # File exists in the database, check if content has changed
-                    db_etag = file_record.get('etag', None)
-                    if db_etag == event_etag:
-                        # ETag matches, file content hasn't changed
-                        print(f"File {file_path} has not changed (ETag matches).")
-                    else:
-                        # ETag is different, meaning file content has changed
-                        print(f"Modified file detected: {file_path}")
-
-                        # Update the file record with the new ETag and timestamp
-                        collection.find_one_and_update(
-                            {"bucket": bucket_name, "file_path": file_path},
-                            {
-                                "$set": {
-                                    "etag": event_etag,
-                                    "timestamp": record['eventTime']
-                                }
-                            },
-                            return_document=ReturnDocument.AFTER
-                        )
-
-                # Handle file deletion (remove metadata from DB)
-                if 'ObjectRemoved' in s3_event:
-                    print(f"File deleted: {file_path}")
-                    collection.delete_one({"bucket": bucket_name, "file_path": file_path})
-
-            return {
-                "statusCode": 200,
-                "body": json.dumps("S3 event processed successfully.")
-            }
-
-        else:
-            return {
-                "statusCode": 400,
-                "body": json.dumps("Unsupported event source.")
-            }
-
-    except Exception as e:
-        print(f"Error: {str(e)}")
-        return {
-            "statusCode": 500,
-            "body": json.dumps(f"Error processing event: {str(e)}")
-        }
-```
+### **Updated Python Script**
+The Lambda function code is available [here](https://raw.githubusercontent.com/tushardashpute/S3-to-MongoDB-Integration-with-AWS-Lambda/refs/heads/main/insert_to_mangodb.py). Make sure to use this updated version.
 
 ---
 
@@ -197,15 +96,17 @@ Create an IAM role with the following policies:
 
 ### **2. Package the Code**
 
-1. Install the required dependencies:
+1. Download the updated `insert_to_mangodb.py` file:
    ```bash
-   mkdir python
-   pip install pymongo -t python
-   zip -r function.zip python
-   zip -g function.zip lambda_function.py
+   wget -O lambda_function.py https://raw.githubusercontent.com/tushardashpute/S3-to-MongoDB-Integration-with-AWS-Lambda/refs/heads/main/insert_to_mangodb.py
    ```
 
-2. Upload the `function.zip` to AWS Lambda.
+2. Package the Lambda function:
+   ```bash
+   zip function.zip lambda_function.py
+   ```
+
+3. Upload the `function.zip` to AWS Lambda.
 
 ### **3. Configure S3 Event Notifications**
 
@@ -236,6 +137,21 @@ Set up an event notification on your S3 bucket:
    ```
 
 4. Confirm the metadata is removed from MongoDB.
+
+---
+
+## API Gateway Integration
+
+### **Download File Endpoint**
+1. Use the Lambda function to handle `GET` requests for downloading files.
+2. The expected query parameters are:
+   - `bucket`: Name of the S3 bucket.
+   - `file`: Path to the file in the bucket.
+
+3. Example request:
+   ```bash
+   curl "https://<api-gateway-id>.execute-api.<region>.amazonaws.com/dev/download?bucket=your-bucket-name&file=testfile.txt"
+   ```
 
 ---
 
